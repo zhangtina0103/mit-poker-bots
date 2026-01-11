@@ -33,6 +33,14 @@ class Player(Bot):
             '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7,
             '8': 8, '9': 9, 'T': 10, 'J': 11, 'Q': 12, 'K': 13, 'A': 14
         }
+        # Opponent modeling
+        self.opp_model = {
+            'hands_played': 0,
+            'showdowns': [],  # List of (equity, won) tuples
+            'tosses': [],     # Cards they tossed
+            'aggression': 0,
+            'vpip': 0,
+        }
 
     def _create_deck(self):
         """Create a standard 52-card deck"""
@@ -53,12 +61,6 @@ class Player(Bot):
         Returns:
         Nothing.
         '''
-        my_bankroll = game_state.bankroll  # the total number of chips you've gained or lost from the beginning of the game to the start of this round
-        # the total number of seconds your bot has left to play this game
-        game_clock = game_state.game_clock
-        round_num = game_state.round_num  # the round number from 1 to NUM_ROUNDS
-        my_cards = round_state.hands[active]  # your cards
-        big_blind = bool(active)  # True if you are the big blind
         pass
 
     def handle_round_over(self, game_state, terminal_state, active):
@@ -75,11 +77,21 @@ class Player(Bot):
         '''
         my_delta = terminal_state.deltas[active]  # your bankroll change from this round
         previous_state = terminal_state.previous_state  # RoundState before payoffs
-        street = previous_state.street  # 0,2,3,4,5,6 representing when this round ended
-        my_cards = previous_state.hands[active]  # your cards
         # opponent's cards or [] if not revealed
         opp_cards = previous_state.hands[1-active]
-        pass
+
+        # Track opponent data
+        self.opp_model['hands_played'] += 1
+
+        # if they showed cards
+        if opp_cards:
+            board = previous_state.board
+            # safety check
+            if len(board) >= 2:
+                # Calculate what equity they had at flop
+                opp_equity = self._calculate_equity(opp_cards, board[:2], num_sims=50)
+                won = my_delta < 0
+                self.opp_model['showdowns'].append((opp_equity, won))
 
     # ==================== HAND EVALUATION HELPERS ====================
     def _evaluate_5card_hand(self, five_cards):
@@ -119,7 +131,6 @@ class Player(Bot):
                     straight_high = sorted_ranks[i+4]
                     break
             # Check wheel (A-2-3-4-5)
-            # unsure? is this true?
             if set([14, 2, 3, 4, 5]).issubset(set(ranks)):
                 is_straight = True
                 straight_high = 5
@@ -204,33 +215,91 @@ class Player(Bot):
 
         return best_score
 
-    def _estimate_hand_strength(self, hole_cards, board):
+    def _calculate_equity(self, my_cards, board, num_sims=100):
         """
-        Estimate hand strength on a 0-1 scale.
+        TRUE win probability via Monte Carlo.
+        This replaces all hand strength calculations.
         """
-        if not hole_cards or len(hole_cards) == 0:
+        if not my_cards or len(my_cards) == 0:
             return 0.0
 
-        # get first element of tuple returned by best hand function
-        hand_score = self._best_hand(hole_cards, board)
-        hand_type = hand_score[0]
+        wins = 0.0
+        ties = 0.0
+        known_cards = set(my_cards + board)
+        remaining_deck = [c for c in self.deck if c not in known_cards]
 
-        # mapping hand types to strength
-        strength_map = {
-            10: 1.00,  # Royal Flush
-            9: 0.99,   # Straight flush
-            8: 0.95,   # Four of a kind
-            7: 0.85,   # Full house
-            6: 0.75,   # Flush
-            5: 0.70,   # Straight
-            4: 0.60,   # Three of a kind
-            3: 0.45,   # Two pair
-            2: 0.30,   # One pair
-            1: 0.15,   # High card
-            0: 0.05,   # Nothing yet
-        }
+        cards_needed = 6 - len(board)
 
-        return strength_map.get(hand_type, 0.1)
+        for _ in range(num_sims):
+            if len(remaining_deck) < 2 + cards_needed:
+                continue
+
+            # Shuffle and deal
+            sim_deck = remaining_deck.copy()
+            random.shuffle(sim_deck)
+
+            opp_cards = sim_deck[:2]
+            future_board = sim_deck[2:2 + cards_needed] if cards_needed > 0 else []
+            full_board = board + future_board
+
+            # Evaluate both hands
+            my_hand = self._best_hand(my_cards, full_board)
+            opp_hand = self._best_hand(opp_cards, full_board)
+
+            if my_hand > opp_hand:
+                wins += 1
+            elif my_hand == opp_hand:
+                ties += 0.5
+
+        return (wins + ties) / num_sims if num_sims > 0 else 0.0
+
+    def _calculate_draw_equity(self, my_cards, board):
+        """Estimate equity from draws (flush, straight)."""
+        if len(board) >= 6:  # River - no draws matter
+            return 0.0
+
+        all_cards = my_cards + board
+        if len(all_cards) < 4:
+            return 0.0
+
+        suits = [c[1] for c in all_cards]
+        ranks = [self.rank_values[c[0]] for c in all_cards]
+
+        draw_equity = 0.0
+        cards_to_come = 6 - len(board)
+
+        # Flush draw (4 to a flush)
+        for suit in set(suits):
+            if suits.count(suit) == 4:
+                if cards_to_come >= 2:
+                    draw_equity += 0.35  # ~35% to hit flush with 2 cards
+                elif cards_to_come == 1:
+                    draw_equity += 0.20  # ~20% with 1 card
+
+        # Open-ended straight draw
+        unique_ranks = sorted(set(ranks))
+        if len(unique_ranks) >= 4:
+            for i in range(len(unique_ranks) - 3):
+                window = unique_ranks[i:i+4]
+                if max(window) - min(window) == 3:  # 4 consecutive
+                    if cards_to_come >= 2:
+                        draw_equity += 0.32
+                    elif cards_to_come == 1:
+                        draw_equity += 0.17
+                    break
+
+        return min(draw_equity, 0.40)  # Cap at 40%
+
+    def _calculate_equity_with_draws(self, my_cards, board, num_sims=100):
+        """Equity + draw potential."""
+        base_equity = self._calculate_equity(my_cards, board, num_sims)
+
+        if len(board) < 6:
+            draw_bonus = self._calculate_draw_equity(my_cards, board)
+            # Weight draws at 40% (they might not hit)
+            return min(1.0, base_equity + draw_bonus * 0.4)
+
+        return base_equity
 
     # quick toss function for if time is running out
     def _quick_toss_heuristic(self, my_cards):
@@ -266,6 +335,38 @@ class Player(Bot):
         card_values = [(self.rank_values[c[0]], i) for i, c in enumerate(my_cards)]
         return min(card_values)[1]
 
+    def _quick_prefilter_toss(self, my_cards):
+        """Check for obvious toss decisions before Monte Carlo."""
+        if len(my_cards) != 3:
+            return None
+
+        ranks = [self.rank_values[c[0]] for c in my_cards]
+        suits = [c[1] for c in my_cards]
+
+        # ALWAYS keep pocket pairs
+        for r in set(ranks):
+            if ranks.count(r) == 2:
+                for i in range(3):
+                    if self.rank_values[my_cards[i][0]] != r:
+                        return i
+
+        # Keep suited cards
+        for s in set(suits):
+            if suits.count(s) == 2:
+                for i in range(3):
+                    if my_cards[i][1] != s:
+                        return i
+
+        # Keep connected cards (like 8-9-7, keep 8-9)
+        sorted_ranks = sorted(ranks)
+        if sorted_ranks[2] - sorted_ranks[0] == 2:  # Three connected
+            # Keep highest two
+            for i in range(3):
+                if self.rank_values[my_cards[i][0]] == sorted_ranks[0]:
+                    return i
+
+        return None  # No obvious choice
+
     # ==================== MONTE CARLO TOSS ====================
     def _monte_carlo_toss(self, my_cards, board, active, num_simulations=500):
         """
@@ -282,6 +383,11 @@ class Player(Bot):
         """
         if len(my_cards) != 3:
             return 0
+
+        # NEW: Quick pre-filter
+        quick_toss = self._quick_prefilter_toss(my_cards)
+        if quick_toss is not None:
+            return quick_toss
 
         # Determine who tosses first
         # Big blind (player 1) tosses first
@@ -355,24 +461,128 @@ class Player(Bot):
         return best_toss_idx
 
     def _opponent_tosses_blind(self, opp_3_cards, board):
-        """
-        Model opponent tossing without seeing our toss.
-        Simple heuristic: toss lowest card.
-        """
-        opp_card_values = [(self.rank_values.get(c[0], 0), i) for i, c in enumerate(opp_3_cards)]
-        return min(opp_card_values)[1]
+        """Model opponent choosing optimal toss based on equity."""
+        best_toss_idx = 0
+        best_equity = -1
+
+        for toss_idx in range(3):
+            remaining = [c for i, c in enumerate(opp_3_cards) if i != toss_idx]
+            # Simulate what equity they'd have after this toss
+            equity = self._calculate_equity(remaining, board, num_sims=30)
+
+            if equity > best_equity:
+                best_equity = equity
+                best_toss_idx = toss_idx
+
+        return best_toss_idx
 
     def _opponent_reacts_to_my_toss(self, opp_3_cards, board, my_tossed_card):
+        """Opponent sees my toss and optimizes."""
+        board_with_my_toss = board + [my_tossed_card]
+        return self._opponent_tosses_blind(opp_3_cards, board_with_my_toss)
+
+
+    def _get_gto_bet_size(self, equity, pot, my_pip, street, in_position):
         """
-        Model opponent reacting to seeing my toss.
-        They can now make a smarter decision.
+        GTO-inspired bet sizing with randomization.
+        Returns the actual bet amount to make (not just multiplier).
         """
-        # For now, still toss their worst card
-        # In Week 2+, you could add logic like:
-        # - If my toss completes a straight, opponent tosses to block it
-        # - If my toss is high, opponent keeps high cards
-        opp_card_values = [(self.rank_values.get(c[0], 0), i) for i, c in enumerate(opp_3_cards)]
-        return min(opp_card_values)[1]
+
+        # River - polarized strategy
+        if street >= 5:
+            if equity >= 0.70:
+                # Strong value bet
+                return int(pot * random.uniform(0.70, 0.90))
+            elif equity >= 0.55:
+                # Medium - mostly check, sometimes small bet
+                if random.random() < 0.35:
+                    return int(pot * random.uniform(0.40, 0.60))
+                return 0  # Check
+            elif equity >= 0.30:
+                # Bluff occasionally
+                if random.random() < 0.25:
+                    return int(pot * random.uniform(0.60, 0.80))
+                return 0
+            else:
+                # Weak - rarely bluff
+                if random.random() < 0.10:
+                    return int(pot * 0.50)
+                return 0
+
+        # Turn
+        elif street >= 4:
+            if equity >= 0.65:
+                return int(pot * random.uniform(0.60, 0.75))
+            elif equity >= 0.50:
+                return int(pot * random.uniform(0.45, 0.60))
+            elif equity >= 0.35:
+                if random.random() < 0.20:
+                    return int(pot * random.uniform(0.35, 0.50))
+                return 0
+            else:
+                if random.random() < 0.15:
+                    return int(pot * 0.40)
+                return 0
+
+        # Flop and earlier
+        else:
+            if equity >= 0.60:
+                return int(pot * random.uniform(0.55, 0.70))
+            elif equity >= 0.45:
+                return int(pot * random.uniform(0.40, 0.55))
+            else:
+                if random.random() < 0.20:
+                    return int(pot * 0.40)
+                return 0
+
+    def _should_call(self, equity, pot_odds, pot, my_stack, opp_stack, street):
+        """
+        Decide whether to call based on equity, pot odds, and implied odds.
+        """
+
+        # Direct pot odds - if equity > pot odds, it's profitable
+        if equity >= pot_odds:
+            return True
+
+        # Implied odds - if we have draws and deep stacks
+        if street < 5:  # Not river
+            effective_stack = min(my_stack, opp_stack)
+
+            # Close to correct odds + deep stacks = call for implied odds
+            if equity >= pot_odds * 0.85 and effective_stack > pot * 2:
+                return True
+
+        # Way behind - just fold
+        if equity < pot_odds * 0.65:
+            return False
+
+        # Marginal spot - add some randomness (GTO balance)
+        threshold = equity / pot_odds
+        return random.random() < threshold
+
+
+    def _get_adaptive_sim_count(self, time_remaining, street):
+        """Allocate simulations based on time and street importance."""
+
+        rounds_played = self.opp_model['hands_played']
+
+        if time_remaining < 5:
+            return {'equity': 10, 'toss': 15}
+        elif time_remaining < 15:
+            return {'equity': 20, 'toss': 30}
+        elif time_remaining < 30:
+            if street >= 5:
+                return {'equity': 40, 'toss': 50}
+            else:
+                return {'equity': 25, 'toss': 30}
+        else:
+            if street >= 5:
+                return {'equity': 60, 'toss': 80}
+            elif street >= 4:
+                return {'equity': 50, 'toss': 60}
+            else:
+                return {'equity': 30, 'toss': 40}
+
 
     def get_action(self, game_state, round_state, active):
         '''
@@ -386,152 +596,125 @@ class Player(Bot):
         Returns:
         Your action.
         '''
-        legal_actions = round_state.legal_actions()  # the actions you are allowed to take
+        legal_actions = round_state.legal_actions()
         street = round_state.street  # 0, 2, 3, 4, 5, or 6
-        my_cards = round_state.hands[active]  # your cards
-        board_cards = round_state.board  # the board cards
+        my_cards = round_state.hands[active]
+        board_cards = round_state.board
 
-        my_pip = round_state.pips[active]  # chips you contributed this round of betting
-        opp_pip = round_state.pips[1-active]  # chips opponent contributed this round of betting
-        my_stack = round_state.stacks[active]  # chips you have remaining
-        opp_stack = round_state.stacks[1-active]  # chips opponent has remaining
+        my_pip = round_state.pips[active]
+        opp_pip = round_state.pips[1-active]
+        my_stack = round_state.stacks[active]
+        opp_stack = round_state.stacks[1-active]
 
-        continue_cost = opp_pip - my_pip  # chips needed to stay in the pot
-        my_contribution = STARTING_STACK - my_stack  # total chips you've put in the pot
-        opp_contribution = STARTING_STACK - opp_stack  # total chips opponent put in
+        continue_cost = opp_pip - my_pip
+        my_contribution = STARTING_STACK - my_stack
+        opp_contribution = STARTING_STACK - opp_stack
         pot = my_contribution + opp_contribution
 
+        time_remaining = game_state.game_clock
+
         # ========================================
-        # TOSS DECISION - Use Monte Carlo!
+        # TOSS DECISION
         # ========================================
         if DiscardAction in legal_actions:
-            time_remaining = game_state.game_clock
-
             # Adaptive strategy based on time remaining
             if time_remaining < 10:
-                # Emergency mode - use fast heuristic only
                 best_toss_idx = self._quick_toss_heuristic(my_cards)
             elif time_remaining < 20:
-                # Low on time - reduced simulations
                 best_toss_idx = self._monte_carlo_toss(
-                    my_cards,
-                    board_cards,
-                    active,
-                    num_simulations=50
+                    my_cards, board_cards, active, num_simulations=30
                 )
             elif time_remaining < 35:
-                # Medium time - moderate simulations
                 best_toss_idx = self._monte_carlo_toss(
-                    my_cards,
-                    board_cards,
-                    active,
-                    num_simulations=100
+                    my_cards, board_cards, active, num_simulations=50
                 )
             else:
-                # Plenty of time - full simulations
                 best_toss_idx = self._monte_carlo_toss(
-                    my_cards,
-                    board_cards,
-                    active,
-                    num_simulations=200
+                    my_cards, board_cards, active, num_simulations=80
                 )
 
             return DiscardAction(best_toss_idx)
 
         # ========================================
-        # BETTING DECISION - Rule-Based
+        # BETTING DECISION
         # ========================================
 
-        # Estimate hand strength
-        strength = self._estimate_hand_strength(my_cards, board_cards)
+        # Get adaptive simulation count
+        sim_counts = self._get_adaptive_sim_count(time_remaining, street)
 
-        # Calculate pot odds for decision making
-        # continue_cost is chips needed to stay in the pot
-        # this calculates proportion of what we beed to input as cost vs. total in pot
+        # Calculate equity with draws
+        equity = self._calculate_equity_with_draws(
+            my_cards, board_cards, num_sims=sim_counts['equity']
+        )
+
+        # Calculate pot odds
         pot_odds = continue_cost / (pot + continue_cost) if pot + continue_cost > 0 else 0
 
-        # Position: SB (player 0) tosses second and acts second - has advantage
+        # Position (SB has advantage - tosses second, acts second on most streets)
         in_position = (active == 0)
 
-        # ========================================
-        # VERY STRONG HAND (75%+)
-        # ========================================
-        if strength >= 0.75:
-            if RaiseAction in legal_actions:
-                # if strength is high, raise bounds
-                min_raise, max_raise = round_state.raise_bounds()
-                # Bet bigger on later streets
-                bet_multiplier = 0.75 if street >= 4 else 0.6
-                bet_size = min(max_raise, my_pip + int(pot * bet_multiplier))
-                return RaiseAction(max(min_raise, bet_size))
-            if CallAction in legal_actions:
-                return CallAction()
-            return CheckAction()
+        # Stack depth
+        effective_stack = min(my_stack, opp_stack)
 
         # ========================================
-        # STRONG HAND (55-75%)
+        # FACING A BET (continue_cost > 0)
         # ========================================
-        if strength >= 0.55:
-            # Free to check
-            if continue_cost == 0:
-                # Value bet more often in position
-                bet_frequency = 0.7 if in_position else 0.5
-                if RaiseAction in legal_actions and random.random() < bet_frequency:
+        if continue_cost > 0:
+            # Very strong hands (70%+ equity) - raise frequently
+            if equity >= 0.70:
+                if RaiseAction in legal_actions and random.random() < 0.60:
                     min_raise, max_raise = round_state.raise_bounds()
-                    bet_size = min(max_raise, my_pip + int(pot * 0.5))
-                    return RaiseAction(max(min_raise, bet_size))
-                return CheckAction()
+                    # Raise 2-3x the pot for value
+                    raise_size = min(max_raise, opp_pip + int((pot + continue_cost) * random.uniform(0.7, 1.0)))
+                    return RaiseAction(max(min_raise, raise_size))
 
-            # Facing a bet - use pot odds and hand strength
-            if CallAction in legal_actions:
-                # Call if we're strong or getting good odds
-                if strength > 0.65 or pot_odds < 0.5:
+                # Always call if we can't raise
+                return CallAction() if CallAction in legal_actions else CheckAction()
+
+            # Strong hands (55-70%) - mostly call, sometimes raise
+            elif equity >= 0.55:
+                if RaiseAction in legal_actions and random.random() < 0.30:
+                    min_raise, max_raise = round_state.raise_bounds()
+                    raise_size = min(max_raise, opp_pip + int(pot * 0.6))
+                    return RaiseAction(max(min_raise, raise_size))
+
+                return CallAction() if CallAction in legal_actions else CheckAction()
+
+            # Medium hands (35-55%) - use pot odds + implied odds
+            elif equity >= 0.35:
+                should_call = self._should_call(
+                    equity, pot_odds, pot, my_stack, opp_stack, street
+                )
+
+                if should_call and CallAction in legal_actions:
                     return CallAction()
 
-            # Sometimes raise as semi-bluff
-            if RaiseAction in legal_actions and random.random() < 0.25:
+                return FoldAction() if FoldAction in legal_actions else CheckAction()
+
+            # Weak hands (<35%) - mostly fold, occasionally bluff
+            else:
+                # Bluff raise when in position (positional advantage)
+                if in_position and RaiseAction in legal_actions and random.random() < 0.12:
+                    min_raise, max_raise = round_state.raise_bounds()
+                    return RaiseAction(min_raise)
+
+                return FoldAction() if FoldAction in legal_actions else CheckAction()
+
+        # ========================================
+        # NOT FACING A BET (can check or bet)
+        # ========================================
+        else:
+            # Get GTO-inspired bet size
+            bet_size = self._get_gto_bet_size(equity, pot, my_pip, street, in_position)
+
+            if bet_size > 0 and RaiseAction in legal_actions:
                 min_raise, max_raise = round_state.raise_bounds()
-                return RaiseAction(min_raise)
+                actual_bet = my_pip + bet_size
+                actual_bet = max(min_raise, min(max_raise, actual_bet))
+                return RaiseAction(actual_bet)
 
-            if CallAction in legal_actions:
-                return CallAction()
-
-            return CheckAction() if CheckAction in legal_actions else FoldAction()
-
-        # ========================================
-        # MEDIUM HAND (35-55%)
-        # ========================================
-        if strength >= 0.35:
-            # Free to check - take it
-            if continue_cost == 0:
-                return CheckAction()
-
-            # Use pot odds - only call if getting good price
-            if CallAction in legal_actions:
-                # Call if our strength beats pot odds with margin
-                if strength > pot_odds * 1.2:  # Need 20% margin for safety
-                    return CallAction()
-
-            # Otherwise fold
-            return FoldAction() if FoldAction in legal_actions else CheckAction()
-
-        # ========================================
-        # WEAK HAND (<35%)
-        # ========================================
-        if continue_cost == 0:
-            # Bluff more often in position
-            bluff_frequency = 0.15 if in_position else 0.08
-            if RaiseAction in legal_actions and random.random() < bluff_frequency:
-                min_raise, max_raise = round_state.raise_bounds()
-                # Small bluff size
-                return RaiseAction(min_raise)
+            # Otherwise check
             return CheckAction()
-
-        # Facing a bet with weak hand - just fold
-        if CheckAction in legal_actions:
-            return CheckAction()
-
-        return FoldAction() if FoldAction in legal_actions else CallAction()
 
 if __name__ == '__main__':
     run_bot(Player(), parse_args())
